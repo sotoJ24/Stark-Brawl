@@ -295,7 +295,7 @@ pub mod brawl_game {
         /// Legacy function for backward compatibility - will panic if path completed
         fn is_path_completed(path_id: u64, index: u32) -> bool {
             match Self::is_path_completed_safe(path_id, index) {
-                Option::None => panic!("Invalid path_id"),
+                Option::None => true,
                 Option::Some(result) => result,
             }
         }
