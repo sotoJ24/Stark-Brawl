@@ -258,31 +258,21 @@ pub mod brawl_game {
             }
         }
 
-        /// Moves an enemy to the next valid step in its path
         fn advance_enemy_position(ref enemy: Enemy, path_id: u64, current_index: u32) -> Enemy {
-            let next_index = current_index + 1;
+            if !enemy.is_alive {
+                return enemy;
+            }
 
-            // Check if we've reached the end of the path
-            match Self::is_path_completed_safe(path_id, next_index) {
-                Option::None => {
-                    // Invalid path_id, return enemy unchanged
-                    enemy
-                },
-                Option::Some(is_completed) => {
-                    if is_completed {
-                        // Enemy has completed the path
-                        enemy
-                    } else {
-                        // Get the next position
-                        match Self::get_path_step(path_id, next_index) {
-                            Option::None => {
-                                // Invalid index, return enemy unchanged
-                                enemy
-                            },
-                            Option::Some((next_x, next_y)) => {
-                                EnemySystem::move_to(@enemy, next_x, next_y)
-                            }
-                        }
+            match Self::get_path_length(path_id) {
+                Option::None => enemy,
+                Option::Some(length) => {
+                    if length == 0_u32 || current_index >= length - 1_u32 {
+                        return enemy;
+                    }
+                    let next_index = current_index + 1_u32;
+                    match Self::get_path_step(path_id, next_index) {
+                        Option::None => enemy, 
+                        Option::Some((next_x, next_y)) => EnemySystem::move_to(@enemy, next_x, next_y),
                     }
                 }
             }
@@ -360,13 +350,13 @@ pub mod brawl_game {
                 _ => Option::None,
             }
         }
-
-        /// Safe version of get_step_from_array that returns Option
-        fn get_step_from_array(steps: Span<(u32, u32)>, index: u32) -> Option<(u32, u32)> {
-            if index >= steps.len() {
+        /// Helper to get a step from a path array safely
+       fn get_step_from_array(steps: Span<(u32, u32)>, index: u32) -> Option<(u32, u32)> {
+            let i: usize = index.into();
+            if i >= steps.len() {
                 Option::None
             } else {
-                Option::Some(*steps.at(index.into()))
+                Option::Some(*steps.at(i))
             }
         }
 
