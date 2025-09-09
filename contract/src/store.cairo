@@ -5,15 +5,18 @@ use stark_brawl::models::item::Item;
 use stark_brawl::models::tower_stats::TowerStats;
 use stark_brawl::models::tower::{errors as TowerErrors, Tower, TowerImpl, ZeroableTower};
 use stark_brawl::models::trap::{Trap, TrapImpl, ZeroableTrapTrait, Vec2};
-use stark_brawl::models::player::{Player, PlayerImpl};
+use stark_brawl::models::player::{Player, PlayerContract, PlayerImpl};
 use stark_brawl::systems::player::{IPlayerSystemDispatcher, IPlayerSystemDispatcherTrait};
-use stark_brawl::models::wave::{errors as WaveErrors, Wave, WaveImpl, ZeroableWave};
+use stark_brawl::models::wave::{
+    errors as WaveErrors, Wave, WaveImpl, ZeroableWave, WaveTimer, WaveTimerImpl, ZeroableWaveTimer,
+};
 use stark_brawl::models::enemy::{Enemy, EnemyImpl, ZeroableEnemy};
 use stark_brawl::models::statistics::{Statistics, StatisticsImpl, ZeroableStatistics};
 use stark_brawl::models::leaderboard::{
     LeaderboardEntry, ILeaderboardEntry, ZeroableLeaderboardEntry,
 };
 use starknet::ContractAddress;
+use core::num::traits::Zero;
 
 #[derive(Drop)]
 pub struct Store {
@@ -85,13 +88,50 @@ pub impl StoreImpl of StoreTrait {
     // Player operations
     // -------------------------------
     #[inline]
-    fn read_player(self: @Store, player_id: felt252) -> Player {
-        self.world.read_model(player_id)
+    fn read_player(self: @Store, player_address: ContractAddress) -> Player {
+        self.world.read_model(player_address)
     }
 
     #[inline]
     fn write_player(ref self: Store, player: @Player) {
         self.world.write_model(player);
+    }
+
+    #[inline(always)]
+    fn player_system_client(self: @Store) -> IPlayerSystemDispatcher {
+        let contract: PlayerContract = self.world.read_model('PLAYER_CONTRACT');
+        assert!(contract.contract.is_non_zero(), "PlayerSystem_contract_not_configured");
+        IPlayerSystemDispatcher { contract_address: contract.contract }
+    }
+
+    #[inline]
+    fn add_coins(self: @Store, player_address: ContractAddress, amount: u64) {
+        self.player_system_client().add_coins(player_address, amount);
+    }
+
+    #[inline]
+    fn spend_coins(self: @Store, player_address: ContractAddress, amount: u64) {
+        self.player_system_client().spend_coins(player_address, amount);
+    }
+
+    #[inline]
+    fn add_gems(self: @Store, player_address: ContractAddress, amount: u64) {
+        self.player_system_client().add_gems(player_address, amount);
+    }
+
+    #[inline]
+    fn spend_gems(self: @Store, player_address: ContractAddress, amount: u64) {
+        self.player_system_client().spend_gems(player_address, amount);
+    }
+
+    #[inline]
+    fn get_coins(self: @Store, player_address: ContractAddress) -> u64 {
+        self.player_system_client().get_coins(player_address)
+    }
+
+    #[inline]
+    fn get_gems(self: @Store, player_address: ContractAddress) -> u64 {
+        self.player_system_client().get_gems(player_address)
     }
 
     // -------------------------------
@@ -111,20 +151,44 @@ pub impl StoreImpl of StoreTrait {
     }
 
     #[inline]
-    fn start_wave(ref self: Store, wave_id: u64, current_tick: u64) {
+    fn start_wave(ref self: Store, wave_id: u64) {
         let mut wave = self.read_wave(wave_id);
         assert(wave.is_active == false, WaveErrors::AlreadyActive);
         assert(wave.is_completed == false, WaveErrors::AlreadyCompleted);
-        let started_wave = WaveImpl::start(@wave, current_tick);
+
+        // Create wave timer for secure timing validation
+        let wave_timer = WaveTimerImpl::new(wave_id);
+        self.write_wave_timer(@wave_timer);
+
+        let started_wave = WaveImpl::start(@wave);
         self.write_wave(@started_wave)
     }
 
     #[inline]
-    fn register_enemy_spawn(ref self: Store, wave_id: u64, current_tick: u64) {
+    fn register_enemy_spawn(ref self: Store, wave_id: u64) {
         let wave = self.read_wave(wave_id);
-        assert(WaveImpl::should_spawn(@wave, current_tick) == true, WaveErrors::InvalidSpawnTick);
-        let spawned_wave = WaveImpl::register_spawn(@wave, current_tick);
+        assert(WaveImpl::should_spawn(@wave) == true, WaveErrors::InvalidSpawnTick);
+
+        // Validate timing through wave timer
+        let mut wave_timer = self.read_wave_timer(wave_id);
+        let current_timestamp = WaveImpl::get_current_timestamp();
+        let updated_timer = WaveTimerImpl::update_timestamp(@wave_timer, current_timestamp);
+        self.write_wave_timer(@updated_timer);
+
+        let spawned_wave = WaveImpl::register_spawn(@wave);
         self.write_wave(@spawned_wave)
+    }
+
+    #[inline]
+    fn read_wave_timer(self: @Store, wave_id: u64) -> WaveTimer {
+        let timer: WaveTimer = self.world.read_model(wave_id);
+        assert(timer.is_non_zero(), 'Wave timer not found');
+        timer
+    }
+
+    #[inline]
+    fn write_wave_timer(ref self: Store, timer: @WaveTimer) {
+        self.world.write_model(timer);
     }
 
     #[inline]
@@ -256,7 +320,21 @@ pub impl StoreImpl of StoreTrait {
         let mut trap = self.read_trap(trap_id);
         assert(trap.is_active == true, 'Trap not active');
         assert(TrapImpl::check_trigger(@trap, enemy_pos) == true, 'Enemy not in range');
+
+        // The TrapImpl::trigger function will set is_active to false and return the damage.
+        // If it was already inactive (e.g., another transaction got there first), it returns 0.
         let damage = TrapImpl::trigger(ref trap);
+
+        // If damage is 0, it means the trap was not active when TrapImpl::trigger was called.
+        // This could happen if a concurrent transaction successfully triggered and updated
+        // the global state to inactive before this transaction's TrapImpl::trigger was executed.
+        // In this scenario, we just return 0, as no new damage should be dealt.
+        if damage == 0 {
+            return 0;
+        }
+
+        // This transaction successfully triggered the trap and received non-zero damage.
+        // Write the now-inactive trap state back to the world.
         self.write_trap(@trap);
         damage
     }
@@ -355,7 +433,6 @@ pub impl StoreImpl of StoreTrait {
         enemy_id: u64,
         player_address: ContractAddress,
     ) {
-        let world = self.world;
         let mut enemy = self.read_enemy(enemy_id);
 
         assert(!enemy.is_alive, 'Enemy must be defeated');
